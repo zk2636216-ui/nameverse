@@ -1,4 +1,5 @@
 const logger = require('../utils/logger');
+const redisClient = require('../config/redis');
 const IslamicModel = require('../../models/IslamicModel');
 const ChristianModel = require('../../models/ChristianModel');
 const HinduModel = require('../../models/HinduModel');
@@ -9,6 +10,48 @@ const models = {
   christian: ChristianModel,
   hindu: HinduModel
 };
+
+/**
+ * Cache key generation utilities
+ */
+const generateNamesListKey = (religion, options) => {
+  const {
+    limit = 20,
+    page = 1,
+    sort = 'asc',
+    gender,
+    origin,
+    category,
+    theme,
+    search,
+    startsWith
+  } = options;
+
+  // Create a stable key from parameters
+  const keyParts = [
+    'names',
+    religion,
+    `limit:${limit}`,
+    `page:${page}`,
+    `sort:${sort}`,
+    gender ? `gender:${gender}` : '',
+    origin ? `origin:${origin}` : '',
+    category ? `category:${category}` : '',
+    theme ? `theme:${theme}` : '',
+    search ? `search:${search}` : '',
+    startsWith ? `startsWith:${startsWith}` : ''
+  ].filter(Boolean);
+
+  return keyParts.join(':').toLowerCase().replace(/\s+/g, '_');
+};
+
+const generateNameKey = (religion, slug) => `name:${religion}:${slug}`;
+
+const generateFiltersKey = (religion) => `filters:${religion}`;
+
+const generateRelatedKey = (religion, slug, limit) => `related:${religion}:${slug}:${limit}`;
+
+const generateSimilarKey = (religion, slug, limit) => `similar:${religion}:${slug}:${limit}`;
 
 /**
  * Get names by religion with filtering and pagination
@@ -178,47 +221,63 @@ const getNamesByReligion = async (religion, options = {}) => {
       break;
   }
 
-  try {
-    const [names, totalCount, filteredCount] = await Promise.all([
-      Model.find(filterQuery)
-        .sort(sortQuery)
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      Model.countDocuments(),
-      Model.countDocuments(filterQuery)
-    ]);
+  // Use cache-aside pattern with 10-minute TTL for filtered results
+  const ttl = 600; // 10 minutes
 
-    return {
-      success: true,
-      religion,
-      pagination: {
-        page,
-        limit,
-        totalPages: Math.ceil(filteredCount / limit),
-        totalCount: filteredCount,
-        hasMore: skip + names.length < filteredCount
-      },
-      filtersApplied: {
-        gender: gender || null,
-        origin: origin || null,
-        category: category || null,
-        theme: theme || null,
-        search: search || null,
-        startsWith: startsWith || null,
-        length: length || null,
-        popularity: popularity || null,
-        trending: trending || null,
-        sort
-      },
-      count: names.length,
-      data: names
-    };
-  } catch (error) {
-    logger.error('Error in getNamesByReligion:', error);
-    throw error;
-  }
-};
+  const result = await redisClient.getOrSet(cacheKey, async () => {
+    // Add query timeout protection
+    const queryTimeout = setTimeout(() => {
+      throw new Error('Query timeout exceeded');
+    }, 10000); // 10 second timeout
+
+    try {
+      const [names, totalCount, filteredCount] = await Promise.all([
+        Model.find(filterQuery)
+          .sort(sortQuery)
+          .skip(skip)
+          .limit(Math.min(limit, 100)) // Enforce hard limit
+          .lean()
+          .maxTimeMS(8000), // 8 second query timeout
+        Model.countDocuments().maxTimeMS(3000),
+        Model.countDocuments(filterQuery).maxTimeMS(5000)
+      ]);
+
+      clearTimeout(queryTimeout);
+
+      return {
+        success: true,
+        religion,
+        pagination: {
+          page,
+          limit,
+          totalPages: Math.ceil(filteredCount / limit),
+          totalCount: filteredCount,
+          hasMore: skip + names.length < filteredCount
+        },
+        filtersApplied: {
+          gender: gender || null,
+          origin: origin || null,
+          category: category || null,
+          theme: theme || null,
+          search: search || null,
+          startsWith: startsWith || null,
+          length: length || null,
+          popularity: popularity || null,
+          trending: trending || null,
+          sort
+        },
+        count: names.length,
+        data: names
+      };
+    } catch (error) {
+      clearTimeout(queryTimeout);
+      logger.error('Error in getNamesByReligion:', error);
+      throw error;
+    }
+  }, ttl);
+
+  return result.data;
+}
 
 /**
  * Get a specific name by religion and slug
@@ -229,13 +288,24 @@ const getNameBySlug = async (religion, slug) => {
     throw new Error(`Invalid religion: ${religion}`);
   }
 
-  try {
+  // Input validation
+  if (!slug || typeof slug !== 'string' || slug.length > 200) {
+    return null;
+  }
+
+  // Generate cache key
+  const cacheKey = generateNameKey(religion, slug);
+
+  // Use cache-aside pattern with 30-minute TTL for individual names
+  const ttl = 1800; // 30 minutes
+
+  const result = await redisClient.getOrSet(cacheKey, async () => {
     // ✅ FIX: Multi method slug lookup, case insensitive
     let name = await Model.findOne({ slug: slug.toLowerCase() }).lean();
     if (!name) name = await Model.findOne({ slug }).lean();
     if (!name) name = await Model.findOne({ slug: new RegExp(`^${slug}$`, 'i') }).lean();
     if (!name) name = await Model.findOne({ name: new RegExp(`^${slug}$`, 'i') }).lean();
-    
+
     if (!name) {
       return null;
     }
@@ -244,10 +314,9 @@ const getNameBySlug = async (religion, slug) => {
       success: true,
       data: name
     };
-  } catch (error) {
-    logger.error('Error in getNameBySlug:', error);
-    throw error;
-  }
+  }, ttl);
+
+  return result.data;
 };
 
 /**
@@ -568,29 +637,72 @@ const getFilters = async (religion) => {
   try {
     const exclusionStage = buildCategoryExclusionMatch();
 
-    // --- Letters (first character of name) ---
-    const lettersPipeline = [
-      ...(exclusionStage ? [exclusionStage] : []),
-      { $project: { firstLetter: { $substrCP: ["$name", 0, 1] } } },
-      { $group: { _id: "$firstLetter", count: { $sum: 1 } } },
-      { $match: { count: { $gt: 100 } } },
-      { $sort: { _id: 1 } }
-    ];
-    const lettersResults = await Model.aggregate(lettersPipeline);
+    // Use Promise.all to run aggregations in parallel for better performance
+    const [
+      lettersResults,
+      gendersRaw,
+      originsRaw,
+      themesRaw,
+      categoriesRaw,
+      total_names
+    ] = await Promise.all([
+      // --- Letters (first character of name) ---
+      Model.aggregate([
+        ...(exclusionStage ? [exclusionStage] : []),
+        { $project: { firstLetter: { $substrCP: ["$name", 0, 1] } } },
+        { $group: { _id: "$firstLetter", count: { $sum: 1 } } },
+        { $match: { count: { $gt: 100 } } },
+        { $sort: { _id: 1 } }
+      ]).maxTimeMS(5000), // 5 second timeout
+
+      // --- Genders ---
+      Model.aggregate([
+        ...(exclusionStage ? [exclusionStage] : []),
+        { $match: { gender: { $exists: true, $ne: null, $ne: "" } } },
+        { $group: { _id: "$gender", count: { $sum: 1 } } },
+        { $match: { count: { $gt: 100 } } },
+        { $sort: { _id: 1 } }
+      ]).maxTimeMS(5000),
+
+      // --- Origins ---
+      Model.aggregate([
+        ...(exclusionStage ? [exclusionStage] : []),
+        { $match: { origin: { $exists: true, $ne: null, $ne: "" } } },
+        { $group: { _id: "$origin", count: { $sum: 1 } } },
+        { $match: { count: { $gt: 50 } } },
+        { $sort: { _id: 1 } }
+      ]).maxTimeMS(5000),
+
+      // --- Themes ---
+      Model.aggregate([
+        ...(exclusionStage ? [exclusionStage] : []),
+        { $match: { themes: { $exists: true, $ne: [] } } },
+        { $unwind: "$themes" },
+        { $group: { _id: "$themes", count: { $sum: 1 } } },
+        { $match: { count: { $gt: 100 } } },
+        { $sort: { _id: 1 } }
+      ]).maxTimeMS(5000),
+
+      // --- Categories ---
+      Model.aggregate([
+        ...(exclusionStage ? [exclusionStage] : []),
+        { $match: { category: { $exists: true, $ne: [] } } },
+        { $unwind: "$category" },
+        { $group: { _id: "$category", count: { $sum: 1 } } },
+        { $sort: { _id: 1 } }
+      ]).maxTimeMS(5000),
+
+      // Get total names count (excluding filtered ones)
+      Model.countDocuments(exclusionStage ? exclusionStage.$match : {}).maxTimeMS(3000)
+    ]);
+
+    // Process letters
     const letters = lettersResults
       .map(r => r._id)
       .filter(l => l && /^\p{L}$/u.test(l))
       .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 
-    // --- Genders ---
-    const gendersPipeline = [
-      ...(exclusionStage ? [exclusionStage] : []),
-      { $match: { gender: { $exists: true, $ne: null, $ne: "" } } },
-      { $group: { _id: "$gender", count: { $sum: 1 } } },
-      { $match: { count: { $gt: 100 } } },
-      { $sort: { _id: 1 } }
-    ];
-    const gendersRaw = await Model.aggregate(gendersPipeline);
+    // Process genders
     const gendersMap = new Map();
     gendersRaw.forEach(r => {
       const cleaned = normalizeFilterValue(r._id);
@@ -602,36 +714,19 @@ const getFilters = async (religion) => {
     });
     const genders = Array.from(gendersMap.values()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 
-     // --- Origins ---
-     const originsPipeline = [
-       ...(exclusionStage ? [exclusionStage] : []),
-       { $match: { origin: { $exists: true, $ne: null, $ne: "" } } },
-       { $group: { _id: "$origin", count: { $sum: 1 } } },
-       { $match: { count: { $gt: 50 } } },
-       { $sort: { _id: 1 } }
-     ];
-     const originsRaw = await Model.aggregate(originsPipeline);
-     const originsMap = new Map();
-     originsRaw.forEach(r => {
-       const cleaned = normalizeFilterValue(r._id);
-       if (!cleaned) return;
-       const normalized = cleaned.toLowerCase();
-       if (!originsMap.has(normalized)) {
-         originsMap.set(normalized, cleaned);
-       }
-     });
-     const origins = Array.from(originsMap.values()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+    // Process origins
+    const originsMap = new Map();
+    originsRaw.forEach(r => {
+      const cleaned = normalizeFilterValue(r._id);
+      if (!cleaned) return;
+      const normalized = cleaned.toLowerCase();
+      if (!originsMap.has(normalized)) {
+        originsMap.set(normalized, cleaned);
+      }
+    });
+    const origins = Array.from(originsMap.values()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 
-    // --- Themes ---
-    const themesPipeline = [
-      ...(exclusionStage ? [exclusionStage] : []),
-      { $match: { themes: { $exists: true, $ne: [] } } },
-      { $unwind: "$themes" },
-      { $group: { _id: "$themes", count: { $sum: 1 } } },
-      { $match: { count: { $gt: 100 } } },
-      { $sort: { _id: 1 } }
-    ];
-    const themesRaw = await Model.aggregate(themesPipeline);
+    // Process themes
     const themesMap = new Map();
     themesRaw.forEach(r => {
       const cleaned = normalizeFilterValue(r._id);
@@ -643,15 +738,7 @@ const getFilters = async (religion) => {
     });
     const themes = Array.from(themesMap.values()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 
-    // --- Categories ---
-    const categoriesPipeline = [
-      ...(exclusionStage ? [exclusionStage] : []),
-      { $match: { category: { $exists: true, $ne: [] } } },
-      { $unwind: "$category" },
-      { $group: { _id: "$category", count: { $sum: 1 } } },
-      { $sort: { _id: 1 } }
-    ];
-    const categoriesRaw = await Model.aggregate(categoriesPipeline);
+    // Process categories
     const categoriesMap = new Map();
     categoriesRaw.forEach(r => {
       const cleaned = normalizeFilterValue(r._id);
@@ -662,10 +749,6 @@ const getFilters = async (religion) => {
       }
     });
     const categories = Array.from(categoriesMap.values()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-
-    // Get total names count (excluding filtered ones)
-    const totalMatch = exclusionStage ? exclusionStage.$match : {};
-    const total_names = await Model.countDocuments(totalMatch);
 
     return {
       success: true,

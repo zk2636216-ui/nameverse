@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const namesController = require('../../../controllers/namesController');
+const { expensiveLimiter } = require('../../../middleware/rateLimiter');
 
 /**
  * @route   GET /api/v1/names/search
@@ -10,7 +11,7 @@ const namesController = require('../../../controllers/namesController');
  * @query   {number} limit - Number of results (default: 20, max: 50)
  * @access  Public
  */
-router.get('/search', async (req, res, next) => {
+router.get('/search', expensiveLimiter, async (req, res, next) => {
   try {
     const { q, religion, limit = 20 } = req.query;
 
@@ -21,11 +22,18 @@ router.get('/search', async (req, res, next) => {
       });
     }
 
+    // Limit search query length to prevent abuse
+    const searchQuery = q.trim().substring(0, 100);
+    const parsedLimit = Math.min(Math.max(1, parseInt(limit) || 20), 50);
+
     const result = await namesController.getNamesByReligion(religion || 'islamic', {
-      search: q,
-      limit: Math.min(parseInt(limit) || 20, 50)
+      search: searchQuery,
+      limit: parsedLimit
     });
 
+    // Add cache headers for search results
+    res.set('Cache-Control', 'public, max-age=300'); // 5 minutes
+    res.set('X-Cache-Source', 'redis');
     res.json(result);
   } catch (error) {
     next(error);
@@ -64,9 +72,21 @@ router.get('/:religion', async (req, res, next) => {
       sort = 'asc'
     } = req.query;
 
+    // Input validation and limits
+    const parsedPage = Math.max(1, parseInt(page) || 1);
+    const parsedLimit = Math.min(Math.max(1, parseInt(limit) || 50), 100); // 1-100 range
+
+    // Prevent excessive pagination
+    if (parsedPage > 1000) {
+      return res.status(400).json({
+        success: false,
+        error: 'Page number too high. Use search or filters instead.'
+      });
+    }
+
     const result = await namesController.getNamesByReligion(religion, {
-      page: parseInt(page) || 1,
-      limit: Math.min(parseInt(limit) || 50, 100),
+      page: parsedPage,
+      limit: parsedLimit,
       gender,
       origin,
       category,
@@ -76,6 +96,9 @@ router.get('/:religion', async (req, res, next) => {
       sort
     });
 
+    // Add cache headers for filtered lists - cache for 10 minutes
+    res.set('Cache-Control', 'public, max-age=600');
+    res.set('X-Cache-Source', 'redis');
     res.json(result);
   } catch (error) {
     next(error);
@@ -88,7 +111,7 @@ router.get('/:religion', async (req, res, next) => {
  * @param   {string} religion - Religion: islamic, christian, hindu
  * @access  Public
  */
-router.get('/:religion/filters', async (req, res, next) => {
+router.get('/:religion/filters', expensiveLimiter, async (req, res, next) => {
   try {
     const result = await namesController.getFilters(req.params.religion);
     res.json(result);
