@@ -223,6 +223,7 @@ const getNamesByReligion = async (religion, options = {}) => {
 
   // Use cache-aside pattern with 10-minute TTL for filtered results
   const ttl = 600; // 10 minutes
+  const cacheKey = generateNamesListKey(religion, options);
 
   const result = await redisClient.getOrSet(cacheKey, async () => {
     // Add query timeout protection
