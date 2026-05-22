@@ -628,11 +628,19 @@ const normalizeFilterValue = (val) => {
  * Get filter options for a specific religion.
  * Returns normalized origin and category values and includes all category filters.
  * Applies category word exclusion (e.g. 'adult') so excluded names do not count toward filter totals.
+ * Results are cached in Redis for 2 hours to avoid expensive re-computation.
  */
 const getFilters = async (religion) => {
   const Model = models[religion.toLowerCase()];
   if (!Model) {
     throw new Error(`Invalid religion: ${religion}`);
+  }
+
+  // Check cache first
+  const cacheKey = generateFiltersKey(religion);
+  const cached = await redisClient.get(cacheKey);
+  if (cached) {
+    return cached;
   }
 
   try {
@@ -751,7 +759,7 @@ const getFilters = async (religion) => {
     });
     const categories = Array.from(categoriesMap.values()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 
-    return {
+    const result = {
       success: true,
       religion,
       data: {
@@ -763,6 +771,11 @@ const getFilters = async (religion) => {
         total_names
       }
     };
+
+    // Cache the result for 2 hours
+    await redisClient.set(cacheKey, result, 7200);
+
+    return result;
   } catch (error) {
     logger.error('Error in getFilters:', error);
     throw error;
